@@ -5,3 +5,4 @@ requests>=2.13
 ruamel.yaml>=0.14.2
 six>=1.10
 structlog[dev]>=16.1
+git+https://github.com/openshift/openshift-restclient-python.git@master#egg=openshift-1.0.0
