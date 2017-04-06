@@ -83,7 +83,7 @@ def _add_container_ports(ports, existing_ports):
 DOCKER_VOL_PERMISSIONS = ['rw', 'ro', 'z', 'Z']
 
 
-def _kube_volumes(self, docker_volumes):
+def _kube_volumes(docker_volumes):
     """ Given an array of Docker volumes return a set of volumes and a set of volumeMounts """
     volumes = []
     volume_mounts = []
@@ -442,8 +442,8 @@ class Deployment(object):
 
             task['name'] = 'Create deployment'
             task['openshift_v1_deployment_config'] = CommentedMap()
-            task['openshift_v1_deployment']['state'] = 'present'
-            task['openshift_v1_deployment']['service_definition'] = template
+            task['openshift_v1_deployment_config']['state'] = 'present'
+            task['openshift_v1_deployment_config']['service_definition'] = template
             tasks.append(task)
         return tasks
 

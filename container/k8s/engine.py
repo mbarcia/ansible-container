@@ -96,7 +96,7 @@ class Engine(DockerEngine):
         logger.debug(u'Created playbook to run project', playbook=playbook)
         return playbook
 
-    def _create_ks8_object(self, api_version, kind, request):
+    def _create_k8s_object(self, api_version, kind, request):
         name = request.get('metadata', {}).get('name')
         namespace = request.get('metadata', {}).get('namespace')
 
