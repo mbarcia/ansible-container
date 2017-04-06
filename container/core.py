@@ -146,10 +146,11 @@ def hostcmd_build(base_path, project_name, engine_name, var_file=None,
     if conductor_container_id:
         engine_obj.delete_container(conductor_container_id)
 
+    logger.debug('Config settings', config=config, rawsettings=config.get('settings'),
+                 tconf=type(config), settings=config.get('settings', {}))
     engine_obj.await_conductor_command(
         'build', dict(config), base_path, kwargs,
-        save_container=config.get('settings', {}).get('save_build_container', False))
-
+        save_container=(config['settings'] or {}).get('save_build_container', False))
 
 
 @host_only
@@ -167,12 +168,16 @@ def hostcmd_run(base_path, project_name, engine_name, var_file=None, cache=True,
         logger.error(msg, engine=engine_obj.display_name)
         raise Exception(msg)
 
-    deployment_path = config.get('settings', {}).get('deployment_output_path', DEFAULT_DEPLOYMENT_PATH)
+    deployment_path = (config['settings'] or {}).get('deployment_output_path', DEFAULT_DEPLOYMENT_PATH)
     deployment_path = os.path.normpath(os.path.expanduser(deployment_path))
-    params = dict()
+    params = {'deployment_output_path': deployment_path}
     if kwargs:
         params.update(kwargs)
-    params['deployment_output_path'] = deployment_path
+
+    engine_obj.await_conductor_command(
+        'run', dict(config), base_path, params,
+        save_container=config.get('settings', {}).get('save_build_container', False))
+
 
 @host_only
 def hostcmd_destroy(base_path, project_name, engine_name, var_file=None, cache=True,

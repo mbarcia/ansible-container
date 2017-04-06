@@ -107,8 +107,6 @@ class Engine(BaseEngine):
                     raise exceptions.AnsibleContainerDockerConnectionRefused()
                 else:
                     raise
-            except:
-                raise
         return self._client
 
     @property

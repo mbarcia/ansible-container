@@ -161,7 +161,7 @@ class AnsibleContainerConfig(Mapping):
                     logger.warning("Version '1' is deprecated. Consider upgrading to version '2'.")
 
     def __getitem__(self, item):
-        return self._config.get(item)
+        return self._config.get(item, yaml.compat.ordereddict())
 
     def __iter__(self):
         return iter(self._config)
