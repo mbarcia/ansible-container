@@ -1,4 +1,4 @@
-git+https://github.com/ansible/ansible.git@v2.3.0.0-0.1.rc1#egg=ansible
+git+https://github.com/ansible/ansible.git@devel
 PyYAML>=3.12
 docker-compose>=1.7
 requests>=2.13
