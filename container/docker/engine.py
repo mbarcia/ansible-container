@@ -38,7 +38,7 @@ class Engine(BaseEngine):
     engine_name = 'Docker'
     orchestrator_name = 'Docker Compose'
     builder_container_img_name = 'ansible-container'
-    builder_container_img_tag = 'ansible-container-builder'
+    builder_container_img_tag = 'python:2.7'
     default_registry_url = 'https://index.docker.io/v1/'
     default_registry_name = 'dockerhub'
     _client = None
