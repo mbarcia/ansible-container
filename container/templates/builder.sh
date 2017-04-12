@@ -8,7 +8,7 @@ fi
 if [ -f "./requirements.yml" ]; then
     roles=$(python -c "import yaml; roles = yaml.load(open('./requirements.yml', 'r')); print 0 if not roles else len(roles)")
     if [ "${roles}" -gt 0 ]; then
-        ansible-galaxy install -r ./requirements.yml
+        ansible-galaxy install -r ./requirements.yml --force
     fi
 fi
 
