@@ -1,0 +1,106 @@
+# tasks/main.yml
+--- 
+- name: Remove task.output
+  file:
+    path: ./task.output
+    state: absent
+
+- name: Watowat
+  debug:
+    var: distro
+
+- name: Make temporary workspace
+  tempfile:
+    path: "{{ lookup('env', 'TMPDIR')|default(omit, boolean=True) }}"
+    state: directory
+    suffix: "{{ distro.name }}"
+  register: tempdir
+  # notify: "Cleanup temp dir"
+  tags: always
+
+- name: Make context dirs
+  file:
+    state: directory
+    name: "{{ tempdir.path }}/{{ distro.name }}"
+  tags: always
+
+- name: Make project dirs
+  file:
+    state: directory
+    name: "{{ tempdir.path }}/test-{{ distro.name }}"
+  tags: always
+
+- name: Render Dockerfile
+  template:
+    src: Dockerfile.j2
+    dest: "{{ tempdir.path }}/{{ distro.name }}/Dockerfile"
+  tags: always
+
+- name: Copy build context
+  synchronize:
+    src: "{{ role_path }}/files/"
+    dest: "{{ tempdir.path }}/{{ distro.name }}"
+  tags: always
+
+- name: Run ansible-container import
+  shell: >
+    ansible-container --debug --project-path
+    {{ tempdir.path|quote }}/test-{{ distro.name|quote }} import
+    {{ tempdir.path|quote }}/{{ distro.name|quote }} >>task.output 2>&1
+  register: output
+  ignore_errors: yes
+  tags: always
+
+- include: includes/show-output.yml output_file=./task.output registered_output="{{ output }}"
+
+- name: Validate import
+  shell: pytest tests/validate_import.py >>task.output 2>&1
+  environment:
+    TO_AC: "{{ tempdir.path|quote }}/test-{{ distro.name|quote }}"
+    DISTRO_DATA: "{{ distro|to_json }}"
+  register: output
+  ignore_errors: yes
+  tags:
+    - validate_import
+
+- include: includes/show-output.yml output_file=./task.output registered_output="{{ output }}"
+
+- name: Run ansible-container build
+  shell: >
+    ansible-container --debug --project-path
+    {{ tempdir.path|quote }}/test-{{ distro.name|quote }} build --no-cache >>task.output 2>&1
+  register: output
+  ignore_errors: yes
+  tags:
+    - build
+    - build_no_validate
+
+- include: includes/show-output.yml output_file=./task.output registered_output="{{ output }}"
+
+- name: Get docker images 
+  command: docker images 
+  register: docker_images 
+
+- name: Show docker images 
+  debug: var=docker_images.stdout_lines
+
+- name: Validate build
+  shell: pytest tests/validate_build.py >>task.output 2>&1
+  environment:
+    TO_AC: "{{ tempdir.path|quote }}/test-{{ distro.name|quote }}"
+    DISTRO_DATA: "{{ distro|to_json }}"
+  register: output
+  ignore_errors: yes
+  tags:
+    - build
+    - validate_build
+
+- include: includes/show-output.yml output_file=./task.output registered_output="{{ output }}"
+
+- include_role:
+    name: validate-start-stop-restart
+
+- name: Cleanup temp dir
+  file:
+    name: "{{ tempdir.path }}"
+    state: absent

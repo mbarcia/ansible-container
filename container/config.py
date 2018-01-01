@@ -1,228 +1,250 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 
-import logging
 
-logger = logging.getLogger(__name__)
+from .utils.visibility import getLogger
+logger = getLogger(__name__)
 
+from abc import ABCMeta, abstractproperty, abstractmethod
+from io import BytesIO
 import os
+from os import path
+import copy
 import json
-import yaml
 import re
-import six
+from six import add_metaclass, iteritems, PY2, string_types, text_type
 
-from jinja2 import Environment, FileSystemLoader
 from collections import Mapping
-from .exceptions import AnsibleContainerConfigException
-from .filters import LookupLoader, FilterLoader
-from .temp import MakeTempDir as make_temp_dir
+from .utils.ordereddict import ordereddict
+from ruamel import yaml
+import container
 
-# TODO: Actually do some schema validation
+if container.ENV == 'conductor':
+    from ansible.template import Templar
+    try:
+        from ansible.utils.unsafe_proxy import AnsibleUnsafeText
+    except ImportError:
+        from ansible.vars.unsafe_proxy import AnsibleUnsafeText
+
+from .exceptions import AnsibleContainerConfigException, AnsibleContainerNotInitializedException
+from .utils import get_metadata_from_role, get_defaults_from_role
+
+# jag: Division of labor between outer utility and conductor:
+#
+# Out here, we will parse the container.yml and process AC_* environment
+# variables/--var-file into finding the resulting variable defaults values.
+# We will do zero Jinja processing out here.
+#
+# Inside of the conductor, we will process metadata and defaults from roles and
+# build service-level variables. And since Ansible is actually inside of the
+# conductor container, it is _then_ that we will do Jinja2 processing of the
+# given variable values
 
 
-class AnsibleContainerConfig(Mapping):
-    _config = {}
+DEFAULT_CONDUCTOR_BASE = 'centos:7'
+
+
+@add_metaclass(ABCMeta)
+class BaseAnsibleContainerConfig(Mapping):
+    _config = ordereddict()
     base_path = None
-    lookup_loader = LookupLoader()
-    filter_loader = FilterLoader()
+    engine_list = ['docker', 'openshift', 'k8s']
 
-    def __init__(self, base_path, var_file=None):
+    @container.host_only
+    def __init__(self, base_path, vars_files=None, engine_name=None, project_name=None, vault_files=None):
         self.base_path = base_path
-        self.var_file = var_file
-        self.config_path = os.path.join(self.base_path, 'ansible/container.yml')
-        self.all_filters = self.filter_loader.all()
+        self.cli_vars_files = vars_files
+        self.engine_name = engine_name
+        self.config_path = path.join(self.base_path, 'container.yml')
+        self.cli_project_name = project_name
+        self.cli_vault_files = vault_files
+        self.remove_engines = set(self.engine_list) - set([engine_name])
         self.set_env('prod')
 
-    def set_env(self, env):
-        '''
-        Loads config from container.yml, performs Jinja templating, and stores the resulting dict to self._config.
+    @property
+    def deployment_path(self):
+        dep_path = self.get('settings', ordereddict()).get('deployment_output_path',
+                            path.join(self.base_path, 'ansible-deployment/'))
+        return path.normpath(path.abspath(path.expanduser(path.expandvars(dep_path))))
+
+    @property
+    def project_name(self):
+        if self.cli_project_name:
+            # Give precedence to CLI args
+            return self.cli_project_name
+        if self._config.get('settings', {}).get('project_name', None):
+            # Look for settings.project_name
+            return self._config['settings']['project_name']
+        return os.path.basename(self.base_path)
+
+    @property
+    def conductor_base(self):
+        if self._config.get('settings', {}).get('conductor_base'):
+            return self._config['settings']['conductor_base']
+        if self._config.get('settings', {}).get('conductor', {}).get('base'):
+            return self._config['settings']['conductor']['base']
+        return DEFAULT_CONDUCTOR_BASE
+
+    @property
+    def vault_files(self):
+        if self.cli_vault_files:
+            # Give precedence to CLI args
+            return self.cli_vault_files
+        if self._config.get('settings', {}).get('vault_files'):
+            return self._config['settings']['vault_files']
+
+    @property
+    def vault_password_file(self):
+        if self.cli_vault_password_file:
+            # Give precedence to CLI args
+            return self.cli_vault_password_file
+        if self._config.get('settings', {}).get('vault_password_file'):
+            return self._config['settings']['vault_password_file']
+
+    @property
+    def save_conductor(self):
+        return self._config.get('settings', {}).get('save_conductor_container', False) or \
+               self._config.get('settings', {}).get('conductor', {}).get('save', False)
+
+    @property
+    @abstractproperty
+    def image_namespace(self):
+        # When pushing images or deploying, we need to know the default namespace
+        pass
+
+    @abstractmethod
+    def set_env(self, env, config=None):
+        """
+        Loads config from container.yml,  and stores the resulting dict to self._config.
 
         :param env: string of either 'dev' or 'prod'. Indicates 'dev_overrides' handling.
         :return: None
-        '''
+        """
         assert env in ['dev', 'prod']
-        context = self._get_variables()
-        config = self._render_template(context=context)
-        try:
-            config = yaml.safe_load(config)
-        except yaml.YAMLError as exc:
-            raise AnsibleContainerConfigException(u"Parsing container.yml - %s" % str(exc))
+
+        if not config:
+            try:
+                config = yaml.round_trip_load(open(self.config_path))
+            except IOError:
+                raise AnsibleContainerNotInitializedException()
+            except yaml.YAMLError as exc:
+                raise AnsibleContainerConfigException(u"Parsing container.yml - %s" % text_type(exc))
 
         self._validate_config(config)
 
-        if config.get('defaults'):
-            del config['defaults']
-
-        for service, service_config in (config.get('services') or {}).items():
-            if not service_config or isinstance(service_config, six.string_types):
+        for service, service_config in iteritems(config.get('services') or {}):
+            if not service_config or isinstance(service_config, string_types):
                 raise AnsibleContainerConfigException(u"Error: no definition found in container.yml for service %s."
                                                       % service)
-            if isinstance(service_config, dict):
-                dev_overrides = service_config.pop('dev_overrides', {})
-                if env == 'dev':
-                    service_config.update(dev_overrides)
+            self._update_service_config(env, service_config)
 
-        logger.debug(u"Config:\n%s" % json.dumps(config,
-                                                 sort_keys=True,
-                                                 indent=4,
-                                                 separators=(',', ': ')))
+        # Insure settings['pwd'] = base_path. Will be used later by conductor to resolve $PWD in volumes.
+        if config.get('settings', None) is None:
+            config['settings'] = ordereddict()
+        config['settings']['pwd'] = self.base_path
+
+        self._resolve_defaults(config)
+
+        logger.debug(u"Parsed config", config=config)
         self._config = config
 
-    def _lookup(self, name, *args, **kwargs):
-        lookup_instance = self.lookup_loader.get(name)
-        wantlist = kwargs.pop('wantlist', False)
-        try:
-            ran = lookup_instance.run(args, {}, **kwargs)
-        except Exception as exc:
-            raise AnsibleContainerConfigException("Error in filter %s - %s" % (name, exc))
+    def _update_service_config(self, env, service_config):
+        if isinstance(service_config, dict):
+            dev_overrides = service_config.pop('dev_overrides', {})
+            if env == 'dev':
+                service_config.update(dev_overrides)
+        if 'volumes' in service_config:
+            # Expand ~, ${HOME}, ${PWD}, etc. found in the volume src path
+            updated_volumes = []
+            for volume in service_config['volumes']:
+                vol_pieces = volume.split(':')
+                vol_pieces[0] = path.normpath(path.expandvars(path.expanduser(vol_pieces[0])))
+                updated_volumes.append(':'.join(vol_pieces))
+            service_config['volumes'] = updated_volumes
 
-        if ran and not wantlist:
-            ran = ','.join(ran)
-        return ran
+        for engine_name in self.remove_engines:
+            if engine_name in service_config:
+                del service_config[engine_name]
 
-    def _render_template(self, context=None, path=None, template='container.yml'):
-        '''
-        Apply Jinja template rendering to a given template. If no template provided, template ansible/container.yml
+    def _resolve_defaults(self, config):
+        """
+        Defaults are in the container.yml, overridden by any --var-file param given,
+        and finally overridden by any AC_* environment variables.
 
-        :param template_vars: dict providing Jinja context
-        :return: dict
-        '''
-        if not context:
-            context = dict()
-        if not path:
-            path = os.path.join(self.base_path, 'ansible')
-        j2_env = Environment(loader=FileSystemLoader(path))
-        j2_env.globals['lookup'] = self._lookup
-        j2_env.filters.update(self.all_filters)
-        j2_tmpl = j2_env.get_template(template)
-        tmpl = j2_tmpl.render(**context)
-        if isinstance(tmpl, six.binary_type):
-            tmpl = tmpl.encode('utf8')
-        return tmpl
+        :param config: Loaded YAML config
+        :return: None
+        """
+        if config.get('defaults'):
+            # convert config['defaults'] to an ordereddict()
+            tmp_defaults = ordereddict()
+            tmp_defaults.update(copy.deepcopy(config['defaults']), relax=True)
+            config['defaults'] = tmp_defaults
+        defaults = config.setdefault('defaults', yaml.compat.ordereddict())
 
-    def _get_variables(self):
-        '''
-        Resolve variables by creating an empty dict and updating it first with the 'defaults' section in the config,
-        then any variables from var_file, and finally any AC_* environment variables. Returns the resulting dict.
+        vars_files = self.cli_vars_files or config.get('settings', {}).get('vars_files')
+        if vars_files:
+            for var_file in vars_files:
+                defaults.update(self._get_variables_from_file(var_file=var_file), relax=True)
 
-        :return: dict
-        '''
-        new_vars = {}
-        new_vars.update(self._get_defaults())
-        if self.var_file:
-            logger.debug('Reading variables from var file...')
-            file_vars = self._get_variables_from_file(self.var_file, context=new_vars)
-            new_vars.update(file_vars)
-        new_vars.update(self._get_environment_variables())
-        logger.debug(u'Template variables:\n %s' % json.dumps(new_vars,
-                                                              sort_keys=True,
-                                                              indent=4,
-                                                              separators=(',', ': ')))
-        return new_vars
+        logger.debug('The default type is', defaults=str(type(defaults)), config=str(type(config)))
+        if PY2 and type(defaults) == ordereddict:
+            defaults.update(self._get_environment_variables(), relax=True)
+        else:
+            defaults.update(self._get_environment_variables())
+        logger.debug(u'Resolved template variables', template_vars=defaults)
 
-    def _get_defaults(self):
-        '''
-        Parse the optional 'defaults' section of container.yml
-
-        :return: dict
-        '''
-        defaults = {}
-        default_lines = ['defaults:']
-        found = False
-        sections = [u'version:', u'services:', u'registries:']
-        try:
-            with open(self.config_path, 'r') as f:
-                for line in f:
-                    if re.search(r'^defaults:', line):
-                        found = True
-                        continue
-                    if found:
-                        if re.sub(u'\n', '', line) not in sections:
-                            default_lines.append(re.sub(u'\n', '', line))
-                        else:
-                            break
-        except (OSError, IOError):
-            raise AnsibleContainerConfigException(u"Failed to open %s. Are you in the correct directory?" %
-                                                  self.config_path)
-
-        if len(default_lines) > 1:
-            # re-assemble the defaults section, template, and parse as yaml
-            with make_temp_dir() as temp_dir:
-                with open(os.path.join(temp_dir, 'defaults.txt'), 'w') as f:
-                    f.write(u'\n'.join(default_lines))
-                default_section = self._render_template(context={}, path=temp_dir, template='defaults.txt')
-            try:
-                config = yaml.safe_load(default_section)
-                defaults.update(config.get('defaults'))
-            except yaml.YAMLError as exc:
-                raise AnsibleContainerConfigException(u"Parsing container.yml - %s" % str(exc))
-        logger.debug(u"Default vars:")
-        logger.debug(json.dumps(defaults, sort_keys=True, indent=4, separators=(',', ': ')))
-        return defaults
-
-    def _get_environment_variables(self):
+    @staticmethod
+    def _get_environment_variables():
         '''
         Look for any environment variables that start with 'AC_'. Returns dict of key:value pairs, where the
         key is the result of removing 'AC_' from the variable name and converting the remainder to lowercase.
         For example, 'AC_DEBUG=1' becomes 'debug: 1'.
 
-        :return dict
+        :return ruamel.ordereddict
         '''
         logger.debug(u'Getting environment variables...')
-        new_vars = {}
-        for var, value in six.iteritems(os.environ):
-            matches = re.match(r'^AC_(.+)$', var)
-            if matches:
-                new_vars[matches.group(1).lower()] = value
-        return new_vars
+        env_vars = ordereddict()
+        for var, value in ((k, v) for k, v in os.environ.items()
+                           if k.startswith('AC_')):
+            env_vars[var[3:].lower()] = value
+        logger.debug(u'Read environment variables', env_vars=env_vars)
+        return env_vars
 
-    def _get_variables_from_file(self, file, context=None):
-        '''
+    def _get_variables_from_file(self, var_file):
+        """
         Looks for file relative to base_path. If not found, checks relative to base_path/ansible.
         If file extension is .yml | .yaml, parses as YAML, otherwise parses as JSON.
 
-        :param file: string: path relative to base_path or base_path/ansible.
-        :param context: dict of any available default variables
-        :return: dict
-        '''
-        file_path = os.path.abspath(file)
-        path = os.path.dirname(file_path)
-        name = os.path.basename(file_path)
-        if not os.path.isfile(file_path):
-            path = self.base_path
-            file_path = os.path.normpath(os.path.join(self.base_path, file))
-            name = os.path.basename(file_path)
-            if not os.path.isfile(file_path):
-                path = os.path.join(self.base_path, 'ansible')
-                file_path = os.path.normpath(os.path.join(path, file))
-                name = os.path.basename(file_path)
-                if not os.path.isfile(file_path):
-                    raise AnsibleContainerConfigException(u"Unable to locate %s. Provide a path relative to %s or %s." % (
-                                                          file, self.base_path, os.path.join(self.base_path, 'ansible')))
-        logger.debug("Use variable file: %s" % file_path)
-        data = self._render_template(context=context, path=path, template=name)
+        :return: ruamel.ordereddict
+        """
+        abspath = path.abspath(var_file)
+        if not path.exists(abspath):
+            dirname, filename = path.split(abspath)
+            raise AnsibleContainerConfigException(
+                u'Variables file "%s" not found. (I looked in "%s" for it.)' % (filename, dirname)
+            )
+        logger.debug("Use variable file: %s", abspath, file=abspath)
 
-        if name.endswith('yml') or name.endswith('yaml'):
+        if path.splitext(abspath)[-1].lower().endswith(('yml', 'yaml')):
             try:
-                config = yaml.safe_load(data)
+                config = yaml.round_trip_load(open(abspath))
             except yaml.YAMLError as exc:
-                raise AnsibleContainerConfigException(u"YAML exception: %s" %  str(exc))
+                raise AnsibleContainerConfigException(u"YAML exception: %s" % text_type(exc))
         else:
             try:
-                config = json.loads(data)
+                config = json.load(open(abspath))
             except Exception as exc:
-                raise AnsibleContainerConfigException(u"JSON exception: %s" % str(exc))
-        return config
-
-
-
+                raise AnsibleContainerConfigException(u"JSON exception: %s" % text_type(exc))
+        return iteritems(config)
 
     TOP_LEVEL_WHITELIST = [
         'version',
+        'settings',
         'volumes',
         'services',
         'defaults',
-        'registries'
+        'registries',
+        'secrets'
     ]
 
     OPTIONS_KUBE_WHITELIST = []
@@ -231,18 +253,30 @@ class AnsibleContainerConfig(Mapping):
 
     SUPPORTED_COMPOSE_VERSIONS = ['1', '2']
 
+    REQUIRED_TOP_LEVEL_KEYS = ['services']
+
+    # TODO: Add more schema validation
+
     def _validate_config(self, config):
+        for key in self.REQUIRED_TOP_LEVEL_KEYS:
+            if config.get(key, None) is None:
+                raise AnsibleContainerConfigException("Missing expected key '{}'".format(key))
+
         for top_level in config:
             if top_level not in self.TOP_LEVEL_WHITELIST:
                 raise AnsibleContainerConfigException("invalid key '{0}'".format(top_level))
+
             if top_level == 'version':
                 if config['version'] not in self.SUPPORTED_COMPOSE_VERSIONS:
                     raise AnsibleContainerConfigException("requested version is not supported")
                 if config['version'] == '1':
                     logger.warning("Version '1' is deprecated. Consider upgrading to version '2'.")
+            else:
+                if config[top_level] is None:
+                    config[top_level] = ordereddict()
 
     def __getitem__(self, item):
-        return self._config.get(item)
+        return self._config[item]
 
     def __iter__(self):
         return iter(self._config)
@@ -251,3 +285,104 @@ class AnsibleContainerConfig(Mapping):
         return len(self._config)
 
 
+class AnsibleContainerConductorConfig(Mapping):
+    _config = None
+
+    @container.conductor_only
+    def __init__(self, container_config):
+        self._config = container_config
+        self._templar = Templar(loader=None, variables={})
+        self._process_defaults()
+        self._process_top_level_sections()
+        self._process_services()
+
+    def _process_section(self, section_value, callback=None, templar=None):
+        if not templar:
+            templar = self._templar
+        processed = ordereddict()
+        for key, value in section_value.items():
+            if isinstance(value, string_types):
+                # strings can be templated
+                processed[key] = templar.template(value)
+                if isinstance(processed[key], AnsibleUnsafeText):
+                    processed[key] = str(processed[key])
+            elif isinstance(value, (list, dict)):
+                # if it's a dimensional structure, it's cheaper just to serialize
+                # it, treat it like a template, and then deserialize it again
+                buffer = BytesIO() # use bytes explicitly, not unicode
+                yaml.round_trip_dump(value, buffer)
+                processed[key] = yaml.round_trip_load(
+                    templar.template(buffer.getvalue())
+                )
+            else:
+                # ints, booleans, etc.
+                processed[key] = value
+            if callback:
+                callback(processed)
+        return processed
+
+    def _process_defaults(self):
+        logger.debug('Processing defaults section...')
+        self.defaults = self._process_section(
+            self._config.get('defaults', ordereddict()),
+            callback=lambda processed: self._templar.set_available_variables(
+                dict(processed)))
+
+    def _process_top_level_sections(self):
+        self._config['settings'] = self._config.get('settings', yaml.compat.ordereddict())
+        for section in ['volumes', 'registries', 'secrets']:
+            logger.debug('Processing section...', section=section)
+            setattr(self, section, dict(self._process_section(self._config.get(section, ordereddict()))))
+
+    def _process_services(self):
+        services = ordereddict()
+        for service, service_data in self._config.get('services', ordereddict()).items():
+            logger.debug('Processing service...', service=service, service_data=service_data)
+            processed = ordereddict()
+            service_defaults = self.defaults.copy()
+            for idx in range(len(service_data.get('volumes', []))):
+                # To mount the project directory, let users specify `$PWD` and
+                # have that filled in with the project path
+                service_data['volumes'][idx] = re.sub(r'\$(PWD|\{PWD\})', self._config['settings'].get('pwd'),
+                                                      service_data['volumes'][idx])
+            for role_spec in service_data.get('roles', []):
+                if isinstance(role_spec, dict):
+                    # A role with parameters to run it with
+                    role_spec_copy = copy.deepcopy(role_spec)
+                    role_name = role_spec_copy.pop('role')
+                    role_args = role_spec_copy
+                else:
+                    role_name = role_spec
+                    role_args = {}
+                role_metadata = get_metadata_from_role(role_name)
+                processed.update(role_metadata, relax=True)
+                service_defaults.update(get_defaults_from_role(role_name),
+                                        relax=True)
+                service_defaults.update(role_args, relax=True)
+            processed.update(service_data, relax=True)
+            logger.debug('Rendering service keys from defaults', service=service, defaults=service_defaults)
+            services[service] = self._process_section(
+                processed,
+                templar=Templar(loader=None, variables=service_defaults)
+            )
+            services[service]['defaults'] = service_defaults
+        self.services = services
+
+    def __getitem__(self, key):
+        if key.startswith('_'):
+            raise KeyError(key)
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)
+
+    def __len__(self):
+        # volumes, registries, services, and defaults
+        return 5
+
+    def __iter__(self):
+        yield self.defaults
+        yield self.registries
+        yield self.volumes
+        yield self.services
+        yield self.secrets
